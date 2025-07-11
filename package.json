@@ -4,7 +4,7 @@
   "description": "TathminiAI Dynamic Project Configuration Server",
   "main": "config-server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node config-server.js",
     "dev": "nodemon config-server.js"
   },
   "dependencies": {
