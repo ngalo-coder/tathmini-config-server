@@ -104,11 +104,8 @@ async function saveProjects(projects) {
 // Health check - MUST be before static files
 app.get('/health', (req, res) => {
     console.log('✅ Health check requested');
-    res.json({ 
-        status: 'healthy', 
-        port: PORT,
-        timestamp: new Date().toISOString() 
-    });
+    // Send 200 OK with minimal response
+    res.status(200).send('OK');
 });
 
 // Test route
@@ -267,11 +264,17 @@ async function start() {
             console.log('');
         });
 
-        // Graceful shutdown
+        // Keep server running - don't close immediately
         process.on('SIGTERM', () => {
-            console.log('SIGTERM signal received: closing HTTP server');
+            console.log('SIGTERM signal received but keeping server alive...');
+            // Don't close the server or exit
+            // Railway will force kill after timeout if needed
+        });
+
+        process.on('SIGINT', () => {
+            console.log('SIGINT signal received, shutting down...');
             server.close(() => {
-                console.log('HTTP server closed');
+                console.log('Server closed');
                 process.exit(0);
             });
         });
