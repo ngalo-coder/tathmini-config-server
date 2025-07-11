@@ -1,21 +1,18 @@
 {
   "name": "tathmini-config-server",
   "version": "1.0.0",
-  "description": "TathminiAI Dynamic Project Configuration Server",
-  "main": "config-server.js",
+  "description": "TathminiAI Configuration Server for Multi-Project Management",
+  "main": "server.js",
   "scripts": {
-    "start": "node config-server.js",
-    "dev": "nodemon config-server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "axios": "^1.5.0"
+    "node-fetch": "^2.6.7"
   },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
-  },
-  "keywords": ["tathmini", "odk", "research", "automation"],
-  "author": "TathminiAI Team",
-  "license": "MIT"
+  "engines": {
+    "node": ">=14.0.0"
+  }
 }

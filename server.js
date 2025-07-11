@@ -1,7 +1,6 @@
-// server.js - Simplified server that stays running on Railway
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
+const fetch = require('node-fetch');
 const path = require('path');
 
 const app = express();
@@ -10,65 +9,62 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
 
-// In-memory storage for projects (persists during container lifetime)
+// In-memory storage
 let projects = [];
 
-// Simple workflow generator
-function generateWorkflow(project) {
-    return {
-        name: `TathminiAI - ${project.name}`,
-        nodes: [
-            {
-                id: "1",
-                name: "Schedule Trigger",
-                type: "n8n-nodes-base.scheduleTrigger",
-                position: [250, 300],
-                parameters: {
-                    rule: {
-                        interval: [{ field: "minutes", value: project.updateFrequency }]
-                    }
-                }
-            },
-            {
-                id: "2", 
-                name: "Fetch ODK Data",
-                type: "n8n-nodes-base.httpRequest",
-                position: [450, 300],
-                parameters: {
-                    url: `${project.odkConnection.url}/v1/projects/${project.odkConnection.projectId}/forms/${project.odkConnection.formId}/submissions`,
-                    authentication: "genericCredentialType",
-                    genericAuthType: "httpBasicAuth"
-                }
-            }
-        ],
-        connections: {
-            "Schedule Trigger": {
-                "main": [[{ "node": "Fetch ODK Data", "type": "main", "index": 0 }]]
-            }
-        }
-    };
-}
+// Serve static files
+app.use(express.static('public'));
 
-// Routes
-app.get('/health', (req, res) => res.send('OK'));
+// Health check
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
 
+// Test ODK connection
 app.post('/api/test-connection', async (req, res) => {
     const { url, email, password, projectId, formId } = req.body;
     
+    console.log('Testing connection to:', url);
+    
     try {
-        // For MVP, just check if all fields are provided
-        if (url && email && password && projectId && formId) {
-            res.json({ 
-                success: true, 
-                message: 'Connection successful',
-                submissionCount: 1 
-            });
-        } else {
-            throw new Error('Missing required fields');
+        // Authenticate with ODK
+        const authResponse = await fetch(`${url}/v1/sessions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ email, password })
+        });
+
+        if (!authResponse.ok) {
+            throw new Error('Authentication failed');
         }
+
+        const { token } = await authResponse.json();
+
+        // Get forms to verify connection
+        const formsResponse = await fetch(
+            `${url}/v1/projects/${projectId}/forms`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            }
+        );
+
+        if (!formsResponse.ok) {
+            throw new Error('Could not access forms');
+        }
+
+        const forms = await formsResponse.json();
+        
+        res.json({ 
+            success: true, 
+            message: `Connection successful! Found ${forms.length} forms.`
+        });
     } catch (error) {
+        console.error('Connection test failed:', error.message);
         res.status(400).json({ 
             success: false, 
             error: error.message 
@@ -76,10 +72,12 @@ app.post('/api/test-connection', async (req, res) => {
     }
 });
 
+// Get all projects
 app.get('/api/projects', (req, res) => {
     res.json(projects);
 });
 
+// Create new project
 app.post('/api/projects', (req, res) => {
     const newProject = {
         id: Date.now().toString(),
@@ -88,9 +86,11 @@ app.post('/api/projects', (req, res) => {
     };
     
     projects.push(newProject);
+    console.log('Project created:', newProject.name);
     res.status(201).json(newProject);
 });
 
+// Update project
 app.patch('/api/projects/:id', (req, res) => {
     const index = projects.findIndex(p => p.id === req.params.id);
     
@@ -102,11 +102,19 @@ app.patch('/api/projects/:id', (req, res) => {
     res.json(projects[index]);
 });
 
+// Delete project
 app.delete('/api/projects/:id', (req, res) => {
+    const initialLength = projects.length;
     projects = projects.filter(p => p.id !== req.params.id);
+    
+    if (projects.length === initialLength) {
+        return res.status(404).json({ error: 'Project not found' });
+    }
+    
     res.json({ success: true });
 });
 
+// Generate n8n workflow
 app.get('/api/projects/:id/workflow', (req, res) => {
     const project = projects.find(p => p.id === req.params.id);
     
@@ -114,16 +122,52 @@ app.get('/api/projects/:id/workflow', (req, res) => {
         return res.status(404).json({ error: 'Project not found' });
     }
     
-    res.json(generateWorkflow(project));
+    const workflow = {
+        name: `TathminiAI - ${project.name}`,
+        nodes: [
+            {
+                parameters: {
+                    rule: {
+                        interval: [{ minutes: project.updateFrequency || 15 }]
+                    }
+                },
+                id: "schedule-trigger",
+                name: "Schedule Trigger",
+                type: "n8n-nodes-base.scheduleTrigger",
+                position: [250, 300]
+            },
+            {
+                parameters: {
+                    url: `${project.odkConnection.url}/v1/projects/${project.odkConnection.projectId}/forms/${project.odkConnection.formId}/submissions`,
+                    authentication: "genericCredentialType",
+                    genericAuthType: "httpBasicAuth",
+                    responseFormat: "json"
+                },
+                id: "fetch-odk-data",
+                name: "Fetch ODK Data",
+                type: "n8n-nodes-base.httpRequest",
+                position: [450, 300]
+            }
+        ],
+        connections: {
+            "Schedule Trigger": {
+                "main": [[{ "node": "Fetch ODK Data", "type": "main", "index": 0 }]]
+            }
+        }
+    };
+    
+    res.json(workflow);
 });
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Visit: https://tathmini-config-server-production.up.railway.app`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ TathminiAI Config Server running on port ${PORT}`);
+    console.log(`📍 Local: http://localhost:${PORT}`);
+    console.log(`🌐 Network: http://0.0.0.0:${PORT}`);
 });
 
-// Ignore SIGTERM from Railway
+// Handle shutdown gracefully
 process.on('SIGTERM', () => {
-    console.log('Received SIGTERM, but staying alive...');
+    console.log('SIGTERM received, keeping server alive...');
+    // Don't exit - let Railway handle it
 });
