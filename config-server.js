@@ -1,462 +1,254 @@
-// TathminiAI Configuration Server
-// File: config-server.js
-
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
+const { generateWorkflow } = require('./workflow-generator');
 
 const app = express();
+
+// Debug PORT configuration
+console.log('🔍 Environment PORT:', process.env.PORT);
+console.log('🔍 All env vars:', Object.keys(process.env).filter(key => key.includes('PORT') || key.includes('RAILWAY')));
+
+// Use Railway's PORT or fallback to 4000
+const PORT = process.env.PORT || 4000;
+console.log(`🎯 Using PORT: ${PORT}`);
+
+// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static('public')); // Serve the HTML interface
+app.use(express.static('public'));
 
-const PORT = process.env.CONFIG_PORT || 4000;
+// File to store projects
 const PROJECTS_FILE = path.join(__dirname, 'projects.json');
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || 'http://your-n8n-server.com/webhook/update-project';
 
-// In-memory storage (in production, use a database)
-let projects = [];
+// Initialize projects file if it doesn't exist
+async function initializeProjects() {
+    try {
+        await fs.access(PROJECTS_FILE);
+        console.log('Found existing projects file');
+    } catch (error) {
+        await fs.writeFile(PROJECTS_FILE, JSON.stringify([]));
+        console.log('Created new projects file');
+    }
+}
 
-// Load projects from file on startup
+// Load projects from file
 async function loadProjects() {
     try {
         const data = await fs.readFile(PROJECTS_FILE, 'utf8');
-        projects = JSON.parse(data);
-        console.log(`Loaded ${projects.length} projects from storage`);
+        return JSON.parse(data);
     } catch (error) {
-        console.log('No existing projects file, starting fresh');
-        projects = [];
+        console.error('Error loading projects:', error);
+        return [];
     }
 }
 
 // Save projects to file
-async function saveProjects() {
-    try {
-        await fs.writeFile(PROJECTS_FILE, JSON.stringify(projects, null, 2));
-        console.log('Projects saved to storage');
-    } catch (error) {
-        console.error('Error saving projects:', error);
-    }
+async function saveProjects(projects) {
+    await fs.writeFile(PROJECTS_FILE, JSON.stringify(projects, null, 2));
 }
 
-// ODK Connection Test Helper
-async function testODKConnection(odkConfig) {
+// API Routes
+
+// Test ODK connection
+app.post('/api/test-connection', async (req, res) => {
+    console.log('📡 Testing connection with:', { 
+        url: req.body.url, 
+        email: req.body.email,
+        projectId: req.body.projectId,
+        formId: req.body.formId 
+    });
+    
+    const { url, email, password, projectId, formId } = req.body;
+    
     try {
-        const { odkServer, odkProjectId, odkUsername, odkPassword } = odkConfig;
-        
-        // Test basic connectivity
-        const url = `${odkServer}/v1/projects/${odkProjectId}/forms`;
-        console.log('Testing ODK connection to:', url);
-        
-        const response = await axios.get(url, {
-            auth: {
-                username: odkUsername,
-                password: odkPassword
+        // Test connection to ODK Central
+        console.log('🔐 Authenticating with ODK...');
+        const authResponse = await fetch(`${url}/v1/sessions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
             },
-            timeout: 10000
+            body: JSON.stringify({ email, password })
         });
-        
-        return {
-            success: true,
-            formsCount: response.data.length,
-            forms: response.data.map(form => ({
-                xmlFormId: form.xmlFormId,
-                name: form.name,
-                version: form.version
-            }))
-        };
-    } catch (error) {
-        console.error('ODK connection test failed:', error.message);
-        return {
-            success: false,
-            error: error.response?.data?.message || error.message
-        };
-    }
-}
 
-// Update n8n workflow with new project configuration
-async function updateN8nWorkflow(project) {
-    try {
-        // This would trigger n8n to update the workflow configuration
-        const response = await axios.post(N8N_WEBHOOK_URL, {
-            action: 'update_project',
-            project: project
+        if (!authResponse.ok) {
+            throw new Error('Authentication failed');
+        }
+
+        const { token } = await authResponse.json();
+        console.log('✅ Authentication successful');
+
+        // Try to fetch form details
+        console.log('📋 Fetching form details...');
+        const formResponse = await fetch(
+            `${url}/v1/projects/${projectId}/forms/${formId}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            }
+        );
+
+        if (!formResponse.ok) {
+            throw new Error('Could not access form');
+        }
+
+        // Get submission count
+        const submissionsResponse = await fetch(
+            `${url}/v1/projects/${projectId}/forms/${formId}/submissions`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            }
+        );
+
+        let submissionCount = 0;
+        if (submissionsResponse.ok) {
+            const submissions = await submissionsResponse.json();
+            submissionCount = submissions.length;
+        }
+
+        console.log(`✅ Connection test successful. Found ${submissionCount} submissions`);
+        res.json({ 
+            success: true, 
+            message: 'Connection successful',
+            submissionCount 
         });
-        
-        console.log('n8n workflow updated for project:', project.id);
-        return { success: true };
     } catch (error) {
-        console.error('Failed to update n8n workflow:', error.message);
-        return { success: false, error: error.message };
+        console.error('❌ Connection test failed:', error.message);
+        res.status(400).json({ 
+            success: false, 
+            error: error.message 
+        });
     }
-}
-
-// Routes
-
-// Serve the configuration interface
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // Get all projects
-app.get('/api/projects', (req, res) => {
-    res.json({
-        success: true,
-        projects: projects.map(p => ({
-            ...p,
-            odkPassword: undefined // Don't send passwords
-        }))
-    });
-});
-
-// Get single project
-app.get('/api/projects/:id', (req, res) => {
-    const project = projects.find(p => p.id === parseInt(req.params.id));
-    if (!project) {
-        return res.status(404).json({ success: false, error: 'Project not found' });
-    }
-    
-    res.json({
-        success: true,
-        project: {
-            ...project,
-            odkPassword: undefined // Don't send password
-        }
-    });
-});
-
-// Test ODK connection
-app.post('/api/test-odk-connection', async (req, res) => {
-    const { odkServer, odkProjectId, odkUsername, odkPassword } = req.body;
-    
-    if (!odkServer || !odkProjectId || !odkUsername || !odkPassword) {
-        return res.status(400).json({
-            success: false,
-            error: 'Missing required ODK connection parameters'
-        });
-    }
-    
-    const result = await testODKConnection(req.body);
-    res.json(result);
+app.get('/api/projects', async (req, res) => {
+    console.log('📋 Fetching all projects');
+    const projects = await loadProjects();
+    res.json(projects);
 });
 
 // Create new project
 app.post('/api/projects', async (req, res) => {
+    console.log('➕ Creating new project:', req.body.name);
     try {
-        const projectData = req.body;
-        
-        // Validate required fields
-        const required = ['title', 'odkServer', 'odkProjectId', 'odkFormId', 'odkUsername', 'odkPassword'];
-        for (const field of required) {
-            if (!projectData[field]) {
-                return res.status(400).json({
-                    success: false,
-                    error: `Missing required field: ${field}`
-                });
-            }
-        }
-        
-        // Test ODK connection before saving
-        const connectionTest = await testODKConnection(projectData);
-        if (!connectionTest.success) {
-            return res.status(400).json({
-                success: false,
-                error: `ODK connection failed: ${connectionTest.error}`
-            });
-        }
-        
-        // Create new project
+        const projects = await loadProjects();
         const newProject = {
-            id: Date.now(),
-            ...projectData,
-            status: 'active',
-            createdAt: new Date().toISOString(),
-            lastSync: null,
-            totalSubmissions: 0,
-            qualityScore: '0%'
+            id: Date.now().toString(),
+            ...req.body,
+            createdAt: new Date().toISOString()
         };
         
         projects.push(newProject);
-        await saveProjects();
+        await saveProjects(projects);
         
-        // Update n8n workflow
-        await updateN8nWorkflow(newProject);
-        
-        res.json({
-            success: true,
-            project: {
-                ...newProject,
-                odkPassword: undefined
-            }
-        });
+        console.log('✅ Project created:', newProject.id);
+        res.status(201).json(newProject);
     } catch (error) {
-        console.error('Error creating project:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('❌ Failed to create project:', error.message);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Update existing project
-app.put('/api/projects/:id', async (req, res) => {
+// Update project
+app.patch('/api/projects/:id', async (req, res) => {
+    console.log('🔧 Updating project:', req.params.id);
     try {
-        const projectId = parseInt(req.params.id);
-        const projectIndex = projects.findIndex(p => p.id === projectId);
+        const projects = await loadProjects();
+        const index = projects.findIndex(p => p.id === req.params.id);
         
-        if (projectIndex === -1) {
-            return res.status(404).json({
-                success: false,
-                error: 'Project not found'
-            });
+        if (index === -1) {
+            return res.status(404).json({ error: 'Project not found' });
         }
         
-        const projectData = req.body;
+        projects[index] = { ...projects[index], ...req.body };
+        await saveProjects(projects);
         
-        // Test ODK connection if credentials changed
-        if (projectData.odkServer || projectData.odkUsername || projectData.odkPassword) {
-            const connectionTest = await testODKConnection({
-                odkServer: projectData.odkServer || projects[projectIndex].odkServer,
-                odkProjectId: projectData.odkProjectId || projects[projectIndex].odkProjectId,
-                odkUsername: projectData.odkUsername || projects[projectIndex].odkUsername,
-                odkPassword: projectData.odkPassword || projects[projectIndex].odkPassword
-            });
-            
-            if (!connectionTest.success) {
-                return res.status(400).json({
-                    success: false,
-                    error: `ODK connection failed: ${connectionTest.error}`
-                });
-            }
-        }
-        
-        // Update project
-        projects[projectIndex] = {
-            ...projects[projectIndex],
-            ...projectData,
-            updatedAt: new Date().toISOString()
-        };
-        
-        await saveProjects();
-        
-        // Update n8n workflow
-        await updateN8nWorkflow(projects[projectIndex]);
-        
-        res.json({
-            success: true,
-            project: {
-                ...projects[projectIndex],
-                odkPassword: undefined
-            }
-        });
+        console.log('✅ Project updated');
+        res.json(projects[index]);
     } catch (error) {
-        console.error('Error updating project:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('❌ Failed to update project:', error.message);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Delete project
-app.delete('/api/projects/:id', async (req, res) => {
+// Generate workflow for project
+app.get('/api/projects/:id/workflow', async (req, res) => {
+    console.log('🔄 Generating workflow for project:', req.params.id);
     try {
-        const projectId = parseInt(req.params.id);
-        const projectIndex = projects.findIndex(p => p.id === projectId);
-        
-        if (projectIndex === -1) {
-            return res.status(404).json({
-                success: false,
-                error: 'Project not found'
-            });
-        }
-        
-        const deletedProject = projects.splice(projectIndex, 1)[0];
-        await saveProjects();
-        
-        // Notify n8n to remove workflow
-        await updateN8nWorkflow({ ...deletedProject, status: 'deleted' });
-        
-        res.json({
-            success: true,
-            message: 'Project deleted successfully'
-        });
-    } catch (error) {
-        console.error('Error deleting project:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Get project statistics
-app.get('/api/projects/:id/stats', async (req, res) => {
-    try {
-        const projectId = parseInt(req.params.id);
-        const project = projects.find(p => p.id === projectId);
+        const projects = await loadProjects();
+        const project = projects.find(p => p.id === req.params.id);
         
         if (!project) {
-            return res.status(404).json({
-                success: false,
-                error: 'Project not found'
-            });
+            return res.status(404).json({ error: 'Project not found' });
         }
         
-        // In production, this would query your Airtable or database
-        // For now, return mock data
-        const stats = {
-            totalSubmissions: project.totalSubmissions || 0,
-            qualityScore: project.qualityScore || '0%',
-            lastSync: project.lastSync,
-            recentSubmissions: [
-                {
-                    date: '2025-07-10',
-                    count: 5,
-                    quality: '95%'
-                },
-                {
-                    date: '2025-07-09', 
-                    count: 3,
-                    quality: '100%'
-                }
-            ],
-            trends: {
-                submissionsThisWeek: 12,
-                submissionsLastWeek: 8,
-                averageQuality: '97.5%'
-            }
-        };
-        
-        res.json({
-            success: true,
-            stats: stats
-        });
+        const workflow = generateWorkflow(project);
+        console.log('✅ Workflow generated');
+        res.json(workflow);
     } catch (error) {
-        console.error('Error getting project stats:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Update project status (activate/deactivate)
-app.patch('/api/projects/:id/status', async (req, res) => {
-    try {
-        const projectId = parseInt(req.params.id);
-        const { status } = req.body;
-        
-        if (!['active', 'inactive'].includes(status)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Status must be either "active" or "inactive"'
-            });
-        }
-        
-        const projectIndex = projects.findIndex(p => p.id === projectId);
-        if (projectIndex === -1) {
-            return res.status(404).json({
-                success: false,
-                error: 'Project not found'
-            });
-        }
-        
-        projects[projectIndex].status = status;
-        projects[projectIndex].updatedAt = new Date().toISOString();
-        
-        await saveProjects();
-        
-        // Update n8n workflow
-        await updateN8nWorkflow(projects[projectIndex]);
-        
-        res.json({
-            success: true,
-            project: {
-                ...projects[projectIndex],
-                odkPassword: undefined
-            }
-        });
-    } catch (error) {
-        console.error('Error updating project status:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Trigger manual sync for a project
-app.post('/api/projects/:id/sync', async (req, res) => {
-    try {
-        const projectId = parseInt(req.params.id);
-        const project = projects.find(p => p.id === projectId);
-        
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                error: 'Project not found'
-            });
-        }
-        
-        // Trigger n8n workflow manually
-        const response = await axios.post(N8N_WEBHOOK_URL, {
-            action: 'manual_sync',
-            project: project
-        });
-        
-        res.json({
-            success: true,
-            message: 'Manual sync triggered successfully'
-        });
-    } catch (error) {
-        console.error('Error triggering manual sync:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('❌ Failed to generate workflow:', error.message);
+        res.status(500).json({ error: error.message });
     }
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        service: 'TathminiAI Configuration Server',
-        timestamp: new Date().toISOString(),
-        projectsCount: projects.length
+    res.json({ 
+        status: 'healthy', 
+        port: PORT,
+        timestamp: new Date().toISOString() 
     });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-    console.error('Unhandled error:', error);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-    });
+// Root endpoint
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: 'Endpoint not found'
-    });
-});
+// Initialize and start server
+async function start() {
+    try {
+        await initializeProjects();
+        
+        // Listen on all interfaces with explicit host binding
+        const server = app.listen(PORT, '0.0.0.0', () => {
+            console.log('');
+            console.log('🚀 TathminiAI Configuration Server Started!');
+            console.log(`📡 Server running on http://0.0.0.0:${PORT}`);
+            console.log(`🌐 External access: https://tathmini-config-server-production.up.railway.app`);
+            console.log(`📊 Health check: https://tathmini-config-server-production.up.railway.app/health`);
+            console.log('');
+            
+            loadProjects().then(projects => {
+                console.log(`📋 Current projects: ${projects.length}`);
+            });
+        });
 
-// Start server
-async function startServer() {
-    await loadProjects();
-    
-    app.listen(PORT, () => {
-        console.log(`🌟 TathminiAI Configuration Server running on port ${PORT}`);
-        console.log(`📱 Web interface: http://localhost:${PORT}`);
-        console.log(`🔗 API endpoint: http://localhost:${PORT}/api`);
-        console.log(`📋 Current projects: ${projects.length}`);
-    });
+        // Keep the process alive
+        process.stdin.resume();
+        
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
 }
 
-startServer().catch(console.error);
+// Handle shutdown signals
+process.on('SIGTERM', () => {
+    console.log('\n📛 SIGTERM received, shutting down gracefully...');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('\n📛 SIGINT received, shutting down gracefully...');
+    process.exit(0);
+});
+
+// Start the server
+start();
